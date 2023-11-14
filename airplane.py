@@ -93,15 +93,18 @@ def generate_training_data(X_start, X_goal, N_sim):
 
 def get_ring_data(X, U, R_lb, R_ub, verbose):
     # Obtain the data within the ring of inner radius R_lb and outer radius R_ub
-    X_out = []
-    U_out = []
-    for i in range(X.shape[0]):
-        if R_lb <= np.sqrt((X[i, 0] - X[i, 3]) ** 2 + (X[i, 1] - X[i, 4]) ** 2) <= R_ub:
-            X_out.append(X[i, :])
-            if U is not None:
-                U_out.append(U[i, :])
-    X_out = np.array(X_out)
-    U_out = np.array(U_out)
+    condition = np.sqrt((X[:, 0] - X[:, 3]) ** 2 + (X[:, 1] - X[:, 4]) ** 2)
+
+    mask = (condition >= R_lb) & (condition <= R_ub)
+
+    X_out = np.array(X)
+    U_out = np.array(U)
+
+    X_out = X_out[mask]
+
+    if U is not None:
+        U_out = U_out[mask]
+
     if verbose:
         print(X_out.shape[0], 'points selected out from', X.shape[0], 'given points')
     return X_out, U_out

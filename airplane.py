@@ -353,29 +353,6 @@ def CFTOC_NMPC(x_init, x_goal, T, N):
     return u_opt
 
 
-def plot_cbf_3d(X, learning, overlap):
-    # Plot the CBF evaluated at X in relative coordinates
-    fig = plt.figure(figsize=(10, 10))
-    ax = fig.gca(projection='3d')
-    rel_x_dist = X[:, 0] - X[:, 3]
-    rel_y_dist = X[:, 1] - X[:, 4]
-    if learning:
-        hx = np.array([h_model(x, params) for x in X])
-        ax.scatter3D(rel_x_dist, rel_y_dist, hx, c=hx, cmap='Blues')
-        if overlap:
-            hx = np.array([ZCBF(x) for x in X])
-            ax.scatter3D(rel_x_dist, rel_y_dist, hx, c=hx, cmap='Reds', alpha=0.2)
-        plt.legend(['h_learn', 'h_true'])
-    else:
-        hx = np.array([ZCBF(x) for x in X])
-        ax.scatter3D(rel_x_dist, rel_y_dist, hx, c=hx, cmap='Reds')
-        if overlap:
-            hx = np.array([h_model(x, params) for x in X])
-            ax.scatter3D(rel_x_dist, rel_y_dist, hx, c=hx, cmap='Blues', alpha=0.2)
-        plt.legend(['h_true', 'h_learn'])
-    plt.show()
-
-
 # The following functions are used in the constructive CBF [Squires et al]
 def b(px, theta):
     return px - (v / w) * np.sin(theta)
@@ -428,47 +405,13 @@ class PRNG(object):
         return k2
 
 
-# A NN is represented as a list of [(W_1, b_1), ..., (W_n, b_n)]
-# where n is the number of layers
-def g_model(inputs, params):
-    for W, b in params[:-1]:
-        outputs = inputs.dot(W) + b
-        inputs = jnp.tanh(outputs)
-    return jnp.squeeze(inputs.dot(params[-1][0]) + params[-1][1])
-
-
-def h_model(inputs, params):
-    return g_model(inputs, params)
-
-
 def alpha(x):
     # The class-K function
     return x ** 3
 
 
-def r_with_input(x, u, params):
-    dh = grad(h_model, argnums=0)(x, params)
-    return jnp.dot(dynamics_f(x), dh) + jnp.dot(dynamics_g(x).T.dot(dh),
-                                                u) + alpha(h_model(x, params))
-
-
-def dynamics_f(x):
-    del x
-    return jnp.zeros((6,))
-
-
 def pytorch_dynamics_f(x):
     return torch.zeros((6,))
-
-
-def dynamics_g(x):
-    def make_block(th):
-        return jnp.array([[jnp.cos(th), 0.0], [jnp.sin(th), 0.0], [0.0, 1.0]])
-
-    ret = jnp.zeros((6, 4))
-    ret = ops.index_update(ret, ops.index[:3, :2], make_block(x[2]))
-    ret = ops.index_update(ret, ops.index[3:, 2:], make_block(x[5]))
-    return ret
 
 
 def pytorch_dynamics_g(x: Tensor):
@@ -485,138 +428,6 @@ def pytorch_dynamics_g(x: Tensor):
 
     ret = torch.concat((top, bottom), axis=1)
     return ret
-
-
-@jit
-def loss_with_input(
-        x_constraint, x_expert_unsafe, u_constraint, u_expert_unsafe, x_boundary, x_safe, x_unsafe,
-        params, safe_value, unsafe_value, lam_constraint, lam_boundary, lam_safe, lam_unsafe, lam_param,
-        gamma
-):
-    def h_model_vmap(x):
-        return vmap(h_model, in_axes=(0, None))(x, params)
-
-    # try to enforce h(x) = 0 on boundary
-    if x_boundary is not None:
-        boundary_cost = jnp.sum(jnp.square(h_model_vmap(x_boundary)))
-    else:
-        boundary_cost = 0.0
-
-    # try to enforce h(x) >= safe_value on safe set
-    safe_cost = jnp.sum(jnp.maximum(safe_value - h_model_vmap(x_safe), 0)) + \
-                jnp.sum(jnp.maximum(safe_value / 10 - h_model_vmap(x_constraint), 0))
-
-    # try to enforce h(x) <= -unsafe_value on unsafe set
-    if x_unsafe is not None:
-        unsafe_cost = jnp.sum(jnp.maximum(h_model_vmap(x_unsafe) + unsafe_value, 0)) + \
-                      jnp.sum(jnp.maximum(h_model_vmap(x_expert_unsafe) + unsafe_value / 10, 0))
-    else:
-        unsafe_cost = 0.0
-
-    # try to enforce the CBF inequality constraint
-    constraint_cost = jnp.sum(
-        jnp.maximum(-vmap(r_with_input, in_axes=(0, 0, None))(x_constraint, u_constraint, params) + gamma, 0.0)) + \
-                      0.001 * jnp.sum(
-        jnp.square(vmap(r_with_input, in_axes=(0, 0, None))(x_constraint, u_constraint, params)))
-
-    param_cost = jnp.sum(jnp.square(ravel_pytree(params)[0]))
-
-    return (
-            lam_constraint * constraint_cost + lam_boundary * boundary_cost + lam_safe * safe_cost
-            + lam_unsafe * unsafe_cost + lam_param * param_cost
-    )
-
-
-def shuffle(key, data):
-    inds = random.shuffle(key, jnp.arange(data.shape[0]))
-    return data[inds]
-
-
-@partial(jit, static_argnums=(1, 2, 3, 4, 5, 6, 7, 8, 9, 10))
-def optimize_nn_with_input(
-        key, num_batches, x_constraint, x_expert_unsafe, u_constraint, u_expert_unsafe, boundary_points,
-        safe_points, unsafe_points, get_params, opt_update, opt_state, start_epoch, num_epochs,
-        safe_value, unsafe_value, lam_constraint, lam_boundary, lam_safe, lam_unsafe, lam_param, gamma
-):
-    def batchify(data, num_batches):
-        assert data.shape[0] >= num_batches
-        batch_size = data.shape[0] // num_batches
-        data = data[:batch_size * num_batches]
-        return data.reshape((num_batches, batch_size) + data.shape[1:])
-
-    lam_constraint_batch = lam_constraint * num_batches
-    lam_boundary_batch = lam_boundary * num_batches
-    lam_safe_batch = lam_safe * num_batches
-    lam_unsafe_batch = lam_unsafe * num_batches
-
-    dloss = grad(loss_with_input, argnums=7)
-
-    x_dim, u_dim = x_constraint.shape[1], u_constraint.shape[1]
-
-    def do_epoch(epoch, args):
-        key, opt_state = args
-
-        # shuffle data
-        sks = random.split(key, num=6)
-        xu_constraint_sh = shuffle(sks[0], jnp.hstack((x_constraint, u_constraint)))
-        xu_expert_unsafe_sh = shuffle(sks[1], jnp.hstack((x_expert_unsafe, u_expert_unsafe)))
-        if boundary_points is not None:
-            boundary_points_sh = shuffle(sks[2], boundary_points)
-        safe_points_sh = shuffle(sks[3], safe_points)
-        if unsafe_points is not None:
-            unsafe_points_sh = shuffle(sks[4], unsafe_points)
-        xu_constraint_batched = batchify(xu_constraint_sh, num_batches)
-        xu_expert_unsafe_batched = batchify(xu_expert_unsafe_sh, num_batches)
-        if boundary_points is not None:
-            boundary_points_batched = batchify(boundary_points_sh, num_batches)
-        else:
-            boundary_points_batched = None
-        safe_points_batched = batchify(safe_points_sh, num_batches)
-        if unsafe_points is not None:
-            unsafe_points_batched = batchify(unsafe_points_sh, num_batches)
-        else:
-            unsafe_points_batched = None
-
-        def do_batch(batch, opt_state):
-            this_xu_constraint = xu_constraint_batched[batch]
-            this_xu_expert_unsafe = xu_expert_unsafe_batched[batch]
-            this_x_constraint = this_xu_constraint[:, :x_dim]
-            this_u_constraint = this_xu_constraint[:, x_dim:]
-            this_x_expert_unsafe = this_xu_expert_unsafe[:, :x_dim]
-            this_u_expert_unsafe = this_xu_expert_unsafe[:, x_dim:]
-            if boundary_points_batched is not None:
-                this_boundary_points = boundary_points_batched[batch]
-            else:
-                this_boundary_points = None
-            this_safe_points = safe_points_batched[batch]
-            if unsafe_points_batched is not None:
-                this_unsafe_points = unsafe_points_batched[batch]
-            else:
-                this_unsafe_points = None
-            g = dloss(
-                this_x_constraint, this_x_expert_unsafe, this_u_constraint,
-                this_u_expert_unsafe, this_boundary_points, this_safe_points, this_unsafe_points,
-                get_params(opt_state), safe_value, unsafe_value, lam_constraint_batch, lam_boundary_batch,
-                lam_safe_batch, lam_unsafe_batch, lam_param, gamma
-            )
-            return opt_update(epoch * num_batches + batch, g, opt_state)
-
-        opt_state = lax.fori_loop(0, num_batches, do_batch, opt_state)
-        return sks[5], opt_state
-
-    _, opt_state = lax.fori_loop(start_epoch, start_epoch + num_epochs, do_epoch, (key, opt_state))
-    return opt_state
-
-
-def cosine_decay(initial_learning_rate, decay_steps, alpha=0.0):
-    # Cosine decay learning rate
-    def step_size(step):
-        step = jnp.minimum(step, decay_steps)
-        cosine_decay = 0.5 * (1 + jnp.cos(jnp.pi * step / decay_steps))
-        decayed = (1 - alpha) * cosine_decay + alpha
-        return initial_learning_rate * decayed
-
-    return step_size
 
 
 # Plot the closed-loop trajectories

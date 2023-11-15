@@ -4,10 +4,17 @@ from functools import partial
 
 import jax.numpy as jnp
 import matplotlib.pylab as plt
+import torch
 from casadi import *
 from jax import random, vmap, jit, grad, ops, lax, tree_util
 from jax.example_libraries import optimizers
 from jax.flatten_util import ravel_pytree
+from skopt.sampler import Hammersly
+from torch import Tensor, autograd
+from torch.nn import Sequential, ReLU
+from torch.optim import Adam
+
+from lipchitz_network import OneLipschitzModule
 
 
 def ODE_RHS(x, u):
@@ -387,7 +394,7 @@ def g_model(inputs, params):
 
 
 def h_model(inputs, params):
-    return g_model(inputs, params) - 0
+    return g_model(inputs, params)
 
 
 def alpha(x):
@@ -406,6 +413,10 @@ def dynamics_f(x):
     return jnp.zeros((6,))
 
 
+def pytorch_dynamics_f(x):
+    return torch.zeros((6,))
+
+
 def dynamics_g(x):
     def make_block(th):
         return jnp.array([[jnp.cos(th), 0.0], [jnp.sin(th), 0.0], [0.0, 1.0]])
@@ -413,6 +424,22 @@ def dynamics_g(x):
     ret = jnp.zeros((6, 4))
     ret = ops.index_update(ret, ops.index[:3, :2], make_block(x[2]))
     ret = ops.index_update(ret, ops.index[3:, 2:], make_block(x[5]))
+    return ret
+
+
+def pytorch_dynamics_g(x: Tensor):
+    zero_block = torch.zeros((x.shape[0], 3, 2), dtype=x.dtype, device=x.device)
+    zero_one_block = torch.zeros((x.shape[0], 3, 1), dtype=x.dtype, device=x.device)
+    zero_one_block[:, -1] = 1.
+    zero = torch.zeros(x.shape[0], dtype=x.dtype, device=x.device)
+
+    r1 = torch.vstack((torch.cos(x[:, 2]), torch.sin(x[:, 2]), zero)).T[:, :, None]
+    r2 = torch.vstack((torch.cos(x[:, 5]), torch.sin(x[:, 5]), zero)).T[:, :, None]
+
+    top = torch.concat((r1, zero_one_block, zero_block), axis=2)
+    bottom = torch.concat((zero_block, r2, zero_one_block), axis=2)
+
+    ret = torch.concat((top, bottom), axis=1)
     return ret
 
 
@@ -577,6 +604,123 @@ def plot_closed_loop_multiple(X_cl_plot):
     # plt.savefig('airplane_traj.pdf', dpi=300)
 
 
+# A NN is represented as a list of [(W_1, b_1), ..., (W_n, b_n)]
+# where n is the number of layers
+def pytorch_h_model(inputs, params):
+    net = []
+
+    previous = None
+
+    for W, b in params[:-1]:
+        if previous is None:
+            previous = W.shape[0]
+
+        next_output = W.shape[1]
+
+        net.append(OneLipschitzModule(previous, next_output))
+
+        net.append(ReLU())
+
+        previous = next_output
+
+    net.append(OneLipschitzModule(previous, 1))
+    return Sequential(*net)
+
+
+def pytorch_r_with_input(h_model, x, u):
+    y_pred = h_model(x)
+
+    dh, = autograd.grad(y_pred, x,
+                        grad_outputs=y_pred.data.new(y_pred.shape).fill_(1),
+                        create_graph=True)
+
+    df = torch.einsum("i,ni->n", torch.zeros((6,)), dh)
+    df = df.reshape(-1, 1)
+
+    dynam_g = pytorch_dynamics_g(x).transpose(2, 1)
+    dynam_dg = torch.einsum("nji,ni->nj", dynam_g, dh)
+
+    dg = torch.einsum("ni,ni->n", dynam_dg, u)
+    dg = dg.reshape(-1, 1)
+
+    a = alpha(h_model(x))
+
+    return df + dg + a
+
+
+def pytorch_loss(h_model, x_constraint, x_expert_unsafe, u_constraint, u_expert_unsafe, x_boundary, x_safe, x_unsafe,
+                 params, safe_value, unsafe_value, lam_constraint, lam_boundary, lam_safe, lam_unsafe, lam_param,
+                 gamma):
+    if x_boundary is not None:
+        boundary_cost = torch.square(h_model(x_boundary)).sum()
+    else:
+        boundary_cost = 0.0
+
+        # try to enforce h(x) >= safe_value on safe set
+
+    safe_cost = torch.relu(safe_value - h_model(x_safe)).sum() + torch.relu(safe_value / 10 - h_model(x_safe)).sum()
+
+    # try to enforce h(x) <= -unsafe_value on unsafe set
+    if x_unsafe is not None:
+        unsafe_cost = torch.relu(h_model(x_unsafe) + unsafe_value).sum() + torch.relu(
+            h_model(x_expert_unsafe) + unsafe_value / 10).sum()
+    else:
+        unsafe_cost = 0.0
+
+    # try to enforce the CBF inequality constraint
+    constraint_cost = torch.relu(-pytorch_r_with_input(h_model, x_constraint, u_constraint) + gamma).sum() + \
+                      0.001 * torch.square(pytorch_r_with_input(h_model, x_constraint, u_constraint)).sum()
+
+    # Seems to be a normalize cost for the weights, you can forgo this as the Lipschitz model helps
+    # reduce the risk of overfitting
+
+    # param_cost = torch.sum(torch.square(ravel_pytree(params)[0]))
+
+    return (
+            lam_constraint * constraint_cost + lam_boundary * boundary_cost + lam_safe * safe_cost
+            + lam_unsafe * unsafe_cost
+        # + lam_param * param_cost # Overfitting loss, you can add this back in if you want later on
+    )
+
+
+def pytorch_training(init_params, num_batches, x_constraint, x_expert_unsafe, u_constraint, u_expert_unsafe,
+                     boundary_points,
+                     safe_points, unsafe_points, start_epoch, num_epochs,
+                     safe_value, unsafe_value, lam_constraint, lam_boundary, lam_safe, lam_unsafe, lam_param, gamma):
+    lam_constraint_batch = lam_constraint * num_batches
+    lam_boundary_batch = lam_boundary * num_batches
+    lam_safe_batch = lam_safe * num_batches
+    lam_unsafe_batch = lam_unsafe * num_batches
+
+    net = pytorch_h_model(x_constraint, init_params)
+
+    x_constraint = torch.tensor(np.array(x_constraint), requires_grad=True)
+    x_expert_unsafe = torch.tensor(np.array(x_expert_unsafe), requires_grad=True)
+    u_constraint = torch.tensor(np.array(u_constraint), requires_grad=True)
+    u_expert_unsafe = torch.tensor(np.array(u_expert_unsafe), requires_grad=True)
+
+    if boundary_points is None:
+        boundary_points = None
+    else:
+        boundary_points = torch.tensor(np.array(boundary_points), requires_grad=True)
+    safe_points = torch.tensor(np.array(safe_points), requires_grad=True)
+
+    if unsafe_points is None:
+        unsafe_points = None
+    else:
+        unsafe_points = torch.tensor(np.array(unsafe_points), requires_grad=True)
+
+    optimizer = Adam(net.parameters())
+
+    loss = pytorch_loss(net, x_constraint, x_expert_unsafe, u_constraint, u_expert_unsafe,
+                        boundary_points,
+                        safe_points, unsafe_points, params, safe_value, unsafe_value, lam_constraint, lam_boundary,
+                        lam_safe,
+                        lam_unsafe, lam_param, gamma)
+
+    print(loss)
+
+
 if __name__ == '__main__':
     T = 1.0  # prediction horizon of MPC
     N = 10  # number of prediction steps of MPC
@@ -587,10 +731,12 @@ if __name__ == '__main__':
     v = 0.1  # parameter used in true CBF
     w = 1.0  # parameter used in true CBF
 
-    if os.path.exists("X_train.npy") and os.path.exists("U_train.npy") and os.path.exists("u_train.npy"):
+    use_human_data = False
+    sf = 1.
+
+    if not (os.path.exists("airplane_example/datasets/CBF-MPC/X_train.npy") and os.path.exists(
+            "airplane_example/datasets/CBF-MPC/U_train.npy")):
         # Option 2: Generate expert demonstrations using CBF-MPC
-        use_human_data = False
-        sf = 1.
         # First generate a set of initial and the corresponding goal states
         X_start_t, X_goal_t = generate_init_condition(R=0.35, num_points=100)
         X_start, X_goal = X_start_t, X_goal_t
@@ -622,9 +768,9 @@ if __name__ == '__main__':
         np.save('U_train.npy', U_train)
         np.save('h_train.npy', h_train)
     else:
-        X_train = np.load('X_train.npy')
-        U_train = np.load('U_train.npy')
-        h_train = np.load('h_train.npy')
+        X_train = np.load("airplane_example/datasets/CBF-MPC/X_train.npy")
+        U_train = np.load('airplane_example/datasets/CBF-MPC/U_train.npy')
+        # h_train = np.load('airplane_example/datasets/CBF-MPC/h_train.npy')
 
     # Define the model for the CBF candidate. We use a fully connected two layer NN.
     n_inputs = 6  # state dimension
@@ -796,7 +942,8 @@ if __name__ == '__main__':
     # plt.axis('equal')
     # plt.legend(['expert trajectories','safe samples','unsafe samples'], fontsize = fs)
     plt.grid()
-    # plt.savefig('airplane_data.pdf', dpi=300)
+    plt.savefig('airplane_data.png', dpi=300)
+    # plt.show()
 
     rng = PRNG(5433)
     start_time = time.time()
@@ -813,6 +960,11 @@ if __name__ == '__main__':
     lam_unsafe = 2.0
     lam_param = 0.1
     gamma = 0.05
+
+    pytorch_training(init_params, num_batches, x_constraint, x_expert_unsafe, u_constraint, u_expert_unsafe, None,
+                     x_safe, x_unsafe, i * block_size, block_size,
+                     safe_value, unsafe_value, lam_constraint, lam_boundary, lam_safe, lam_unsafe, lam_param,
+                     gamma)
 
     opt_init, opt_update, get_params = optimizers.adam(
         step_size=cosine_decay(0.1, num_epochs * num_batches)

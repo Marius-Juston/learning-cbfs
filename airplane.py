@@ -95,8 +95,8 @@ def generate_training_data(X_start, X_goal, N_sim):
         )
         X_train.append(Xcl[:-1, :])
         U_train.append(Ucl)
-    X_train = np.array(X_train)
-    U_train = np.array(U_train)
+    X_train = np.vstack(X_train)
+    U_train = np.vstack(U_train)
     return X_train, U_train
 
 

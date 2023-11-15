@@ -127,9 +127,17 @@ def safe_closed_loop(x_init, x_goal, N_sim, learning, plot, early_stop):
     xt = x_init
     sep_min = np.sqrt((x_init[0] - x_init[3]) ** 2 + (x_init[1] - x_init[4]) ** 2)
     count = 0
+
+    hs = []
+    dhdxs = []
+
     for t in range(N_sim):
         u_opt = CFTOC_NMPC(xt, x_goal, T, N)  # Solve the NMPC problem at the current time
-        u_mod, f_mod = CBF_QP(xt, u_opt, learning)  # Solve the CBF-QP problem at the current time
+        u_mod, f_mod, h, dhdx = CBF_QP(xt, u_opt, learning)  # Solve the CBF-QP problem at the current time
+
+        hs.append(h)
+        dhdxs.append(dhdx)
+
         if np.linalg.norm(np.array(u_opt) - np.array(u_mod)) <= 0.1:
             count += 1
         sep_now = np.sqrt((xt[0] - xt[3]) ** 2 + (xt[1] - xt[4]) ** 2)
@@ -169,6 +177,31 @@ def safe_closed_loop(x_init, x_goal, N_sim, learning, plot, early_stop):
         plt.xlabel('t')
         plt.legend(['u1', 'u2', 'u3', 'u4'])
         plt.grid()
+
+        plt.figure()
+        plt.clf()
+        plt.step(tgrid, np.array(hs))
+        plt.xlabel('t')
+        plt.legend(['h'])
+        plt.grid()
+
+        plt.figure()
+        plt.clf()
+        plt.step(tgrid, np.array(dhdxs))
+        plt.xlabel('t')
+        plt.legend(['dx1', 'dy1', 'dt1', 'dx2', 'dy2', 'dt2'])
+        plt.grid()
+
+        plt.figure()
+        plt.clf()
+
+        tgrid = [ts * k for k in range(N_sim + 1)]
+        distance = np.sqrt((Xcl[:, 0] - Xcl[:, 3]) ** 2 + (Xcl[:, 1] - Xcl[:, 4]) ** 2) - 0.5
+        plt.plot(tgrid, distance)
+        plt.xlabel('t')
+        plt.legend(['contraint'])
+        plt.grid()
+
         plt.show()
     return Xcl, Ucl, sep_min
 
@@ -213,12 +246,12 @@ def CBF_QP(x, u_opt, learning):
     if learning:
 
         in_x = torch.from_numpy(x).type(torch.float)
-        in_x.requires_grad= True
+        in_x.requires_grad = True
         hx = h_model(in_x)
 
         dhdx, = autograd.grad(hx, in_x,
-                            grad_outputs=hx.data.new(hx.shape).fill_(1),
-                            create_graph=True)
+                              grad_outputs=hx.data.new(hx.shape).fill_(1),
+                              create_graph=True)
 
         hx = hx.detach().numpy()
         dhdx = dhdx.detach().numpy()
@@ -235,7 +268,7 @@ def CBF_QP(x, u_opt, learning):
     sol = solver(lbx=lbu, ubx=ubu, lbg=lbg, ubg=ubg)  # Get the optimal solution
     u_mod = sol['x'].full().flatten()
     f_opt = sol['f'].full().flatten()
-    return list(u_mod), list(f_opt)
+    return list(u_mod), list(f_opt), hx, dhdx
 
 
 def CFTOC_NMPC(x_init, x_goal, T, N):

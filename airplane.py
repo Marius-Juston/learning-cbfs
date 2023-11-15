@@ -13,6 +13,8 @@ from skopt.sampler import Hammersly
 from torch import Tensor, autograd
 from torch.nn import Sequential, ReLU
 from torch.optim import Adam
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torch.utils.tensorboard import SummaryWriter
 
 from lipchitz_network import OneLipschitzModule
 
@@ -209,8 +211,17 @@ def CBF_QP(x, u_opt, learning):
     lbu = u_lb  # Variable bounds
     ubu = u_ub
     if learning:
-        hx = h_model(x, params)
-        dhdx = grad(h_model, argnums=0)(x, params)
+
+        in_x = torch.from_numpy(x).type(torch.float)
+        in_x.requires_grad= True
+        hx = h_model(in_x)
+
+        dhdx, = autograd.grad(hx, in_x,
+                            grad_outputs=hx.data.new(hx.shape).fill_(1),
+                            create_graph=True)
+
+        hx = hx.detach().numpy()
+        dhdx = dhdx.detach().numpy()
     else:
         hx = ZCBF(x)
         dhdx = num_grad(x)
@@ -599,9 +610,10 @@ def plot_closed_loop_multiple(X_cl_plot):
     # plt.yticks(np.arange(-2.0, 2.0+0.1, 0.5))
     plt.xlim([-2.0, 2.0])
     plt.ylim([-2.0, 2.0])
-    # plt.axis('equal')
+    plt.axis('equal')
     plt.grid()
-    # plt.savefig('airplane_traj.pdf', dpi=300)
+    plt.savefig('airplane_traj.pdf', dpi=300)
+    plt.show()
 
 
 # A NN is represented as a list of [(W_1, b_1), ..., (W_n, b_n)]
@@ -648,28 +660,28 @@ def pytorch_r_with_input(h_model, x, u):
     return df + dg + a
 
 
-def pytorch_loss(h_model, x_constraint, x_expert_unsafe, u_constraint, u_expert_unsafe, x_boundary, x_safe, x_unsafe,
-                 params, safe_value, unsafe_value, lam_constraint, lam_boundary, lam_safe, lam_unsafe, lam_param,
+def pytorch_loss(h_model, x_constraint, x_expert_unsafe, u_constraint, x_boundary, x_safe, x_unsafe,
+                 safe_value, unsafe_value, lam_constraint, lam_boundary, lam_safe, lam_unsafe, lam_param,
                  gamma):
     if x_boundary is not None:
-        boundary_cost = torch.square(h_model(x_boundary)).sum()
+        boundary_cost = torch.square(h_model(x_boundary)).mean()
     else:
         boundary_cost = 0.0
 
         # try to enforce h(x) >= safe_value on safe set
 
-    safe_cost = torch.relu(safe_value - h_model(x_safe)).sum() + torch.relu(safe_value / 10 - h_model(x_safe)).sum()
+    safe_cost = torch.relu(safe_value - h_model(x_safe)).mean() + torch.relu(safe_value / 10 - h_model(x_safe)).mean()
 
     # try to enforce h(x) <= -unsafe_value on unsafe set
     if x_unsafe is not None:
-        unsafe_cost = torch.relu(h_model(x_unsafe) + unsafe_value).sum() + torch.relu(
-            h_model(x_expert_unsafe) + unsafe_value / 10).sum()
+        unsafe_cost = torch.relu(h_model(x_unsafe) + unsafe_value).mean() + torch.relu(
+            h_model(x_expert_unsafe) + unsafe_value / 10).mean()
     else:
         unsafe_cost = 0.0
 
     # try to enforce the CBF inequality constraint
-    constraint_cost = torch.relu(-pytorch_r_with_input(h_model, x_constraint, u_constraint) + gamma).sum() + \
-                      0.001 * torch.square(pytorch_r_with_input(h_model, x_constraint, u_constraint)).sum()
+    constraint_cost = torch.relu(-pytorch_r_with_input(h_model, x_constraint, u_constraint) + gamma).mean() + \
+                      0.001 * torch.square(pytorch_r_with_input(h_model, x_constraint, u_constraint)).mean()
 
     # Seems to be a normalize cost for the weights, you can forgo this as the Lipschitz model helps
     # reduce the risk of overfitting
@@ -686,18 +698,31 @@ def pytorch_loss(h_model, x_constraint, x_expert_unsafe, u_constraint, u_expert_
 def pytorch_training(init_params, num_batches, x_constraint, x_expert_unsafe, u_constraint, u_expert_unsafe,
                      boundary_points,
                      safe_points, unsafe_points, start_epoch, num_epochs,
-                     safe_value, unsafe_value, lam_constraint, lam_boundary, lam_safe, lam_unsafe, lam_param, gamma):
+                     safe_value, unsafe_value, lam_constraint, lam_boundary, lam_safe, lam_unsafe, lam_param, gamma, use_save=True):
     lam_constraint_batch = lam_constraint * num_batches
     lam_boundary_batch = lam_boundary * num_batches
     lam_safe_batch = lam_safe * num_batches
     lam_unsafe_batch = lam_unsafe * num_batches
 
-    net = pytorch_h_model(x_constraint, init_params)
+    device = 'cpu'
 
-    x_constraint = torch.tensor(np.array(x_constraint), requires_grad=True)
-    x_expert_unsafe = torch.tensor(np.array(x_expert_unsafe), requires_grad=True)
-    u_constraint = torch.tensor(np.array(u_constraint), requires_grad=True)
-    u_expert_unsafe = torch.tensor(np.array(u_expert_unsafe), requires_grad=True)
+    MODEL_PATH_FILE = '1nn.pth'
+
+    net = pytorch_h_model(x_constraint, init_params)
+    net = net.to(device)
+
+    if os.path.exists(MODEL_PATH_FILE):
+        net.load_state_dict(torch.load(MODEL_PATH_FILE))
+
+        if use_save:
+            return net
+
+    # net = torch.compile(net, mode='max-autotune-no-cudagraphs')
+
+    x_constraint = torch.tensor(np.array(x_constraint), requires_grad=True, device=device)
+    x_expert_unsafe = torch.tensor(np.array(x_expert_unsafe), requires_grad=True, device=device)
+    u_constraint = torch.tensor(np.array(u_constraint), requires_grad=True, device=device)
+    u_expert_unsafe = torch.tensor(np.array(u_expert_unsafe), requires_grad=True, device=device)
 
     if boundary_points is None:
         boundary_points = None
@@ -710,15 +735,39 @@ def pytorch_training(init_params, num_batches, x_constraint, x_expert_unsafe, u_
     else:
         unsafe_points = torch.tensor(np.array(unsafe_points), requires_grad=True)
 
-    optimizer = Adam(net.parameters())
+    optimizer = Adam(net.parameters(), lr=1e-3, amsgrad=True)
 
-    loss = pytorch_loss(net, x_constraint, x_expert_unsafe, u_constraint, u_expert_unsafe,
-                        boundary_points,
-                        safe_points, unsafe_points, params, safe_value, unsafe_value, lam_constraint, lam_boundary,
-                        lam_safe,
-                        lam_unsafe, lam_param, gamma)
+    summary_writer = SummaryWriter()
 
-    print(loss)
+    summary_writer.add_graph(net, x_constraint)
+
+    scheduler = CosineAnnealingWarmRestarts(optimizer, 500)
+
+    for i in range(10000):
+        optimizer.zero_grad()
+
+        loss = pytorch_loss(net, x_constraint, x_expert_unsafe, u_constraint, boundary_points,
+                            safe_points, unsafe_points, safe_value, unsafe_value, lam_constraint, lam_boundary,
+                            lam_safe,
+                            lam_unsafe, lam_param, gamma)
+
+        loss.backward()
+        optimizer.step()
+
+        scheduler.step()
+
+        summary_writer.add_scalar('loss', loss, i)
+        summary_writer.add_scalar('lr', scheduler.get_last_lr()[0], i)
+
+        print(
+            "epoch", (i + 1) * block_size, "| loss",
+            loss.item(), "| elapsed",
+                     time.time() - start_time, "seconds"
+        )
+
+    torch.save(net.state_dict(), "1nn.pth")
+
+    return net
 
 
 if __name__ == '__main__':
@@ -873,10 +922,11 @@ if __name__ == '__main__':
             random.uniform(rng.next(), shape=(n_safe_samples // 2,), minval=0.0, maxval=3.1415)
         )).T
         safe_points_ham = Hammersly()
+        random_seed = 0
 
         bounds = [(-2.5, 2.5), (-2.5, 2.5), (0., np.pi), (-2.5, 2.5), (-2.5, 2.5), (0, np.pi)]
 
-        safe_points = np.array(safe_points_ham.generate(bounds, n_safe_samples))
+        safe_points = np.array(safe_points_ham.generate(bounds, n_safe_samples, random_state=random_seed))
 
         safe_points, _ = get_ring_data(
             safe_points, None, 1.5, 2.5, 0
@@ -899,7 +949,7 @@ if __name__ == '__main__':
 
         bounds = [(-Ds, Ds), (-Ds, Ds), (0., np.pi), (-Ds, Ds), (-Ds, Ds), (0, np.pi)]
 
-        unsafe_points_s_far = np.array(safe_points_ham.generate(bounds, n_unsafe_samples))
+        unsafe_points_s_far = np.array(safe_points_ham.generate(bounds, n_unsafe_samples, random_state=random_seed))
 
         unsafe_points_s_far, _ = get_ring_data(unsafe_points_s_far, None, 0, 0.4, verbose=0)
         unsafe_points_s_far = unsafe_points_s_far[0:n_unsafe_samples // n_angle_grid, :]
@@ -972,51 +1022,22 @@ if __name__ == '__main__':
     lam_param = 0.1
     gamma = 0.05
 
-    pytorch_training(init_params, num_batches, x_constraint, x_expert_unsafe, u_constraint, u_expert_unsafe, None,
+    h_model = pytorch_training(init_params, num_batches, x_constraint, x_expert_unsafe, u_constraint, u_expert_unsafe, None,
                      x_safe, x_unsafe, i * block_size, block_size,
                      safe_value, unsafe_value, lam_constraint, lam_boundary, lam_safe, lam_unsafe, lam_param,
-                     gamma)
+                     gamma, use_save=True)
+    h_model = h_model.eval()
 
-    opt_init, opt_update, get_params = optimizers.adam(
-        step_size=cosine_decay(0.1, num_epochs * num_batches)
-    )
-    opt_state = opt_init(init_params)
-    key = rng.next()
-
-    # training loop
-    for i in range(num_blocks):
-        key, subkey = random.split(key)
-        opt_state = tree_util.tree_map(
-            lambda e: e.block_until_ready(),
-            optimize_nn_with_input(
-                key, num_batches, x_constraint, x_expert_unsafe, u_constraint, u_expert_unsafe, None,
-                x_safe, x_unsafe, get_params, opt_update, opt_state, i * block_size, block_size,
-                safe_value, unsafe_value, lam_constraint, lam_boundary, lam_safe, lam_unsafe, lam_param,
-                gamma
-            )
-        )
-        print(
-            "epoch", (i + 1) * block_size, "| loss",
-            loss_with_input(
-                x_constraint,
-                x_expert_unsafe, u_constraint, u_expert_unsafe, None, safe_points, unsafe_points,
-                get_params(opt_state), safe_value, unsafe_value, lam_constraint, lam_boundary, lam_safe,
-                lam_unsafe, lam_param, gamma
-            ), "| elapsed",
-                     time.time() - start_time, "seconds"
-        )
-    params = get_params(opt_state)
-    # np.save('params.npy', params)
 
     # Evaluate and plot the CBF at the training points
     X_draw = X_train[:, :]
     fs = 16  # fontsize
     fig = plt.figure(figsize=(8, 8))
-    ax = fig.gca(projection='3d')
+    ax = fig.add_subplot(projection='3d')
     if use_human_data:
         rel_x_dist = X_draw[:, 0] / sf - X_draw[:, 3] / sf
         rel_y_dist = X_draw[:, 1] / sf - X_draw[:, 4] / sf
-        hxl = np.array([h_model(x, params) for x in X_draw])
+        hxl = np.array([h_model(x) for x in X_draw])
         ax.scatter3D(rel_x_dist, rel_y_dist, hxl, c=hxl, cmap='Blues', alpha=1.0)
         plt.legend(['learned CBF'], fontsize=1.2 * fs)
         ax.set_xticks([-2, 0, 2])
@@ -1028,10 +1049,12 @@ if __name__ == '__main__':
     else:
         rel_x_dist = X_draw[:, 0] - X_draw[:, 3]
         rel_y_dist = X_draw[:, 1] - X_draw[:, 4]
-        hxl = np.array([h_model(x, params) for x in X_draw])
-        ax.scatter3D(rel_x_dist, rel_y_dist, hxl, c=hxl, cmap='Blues', alpha=1.0)
-        hx = np.array([ZCBF(x) for x in X_draw])
-        ax.scatter3D(rel_x_dist, rel_y_dist, hx, c=hx, cmap='Reds', alpha=0.1)
+
+        with torch.no_grad():
+            hxl = h_model(torch.from_numpy(X_draw).type(torch.float))
+            ax.scatter3D(rel_x_dist, rel_y_dist, hxl, c=hxl, cmap='Blues', alpha=1.0)
+            hx = np.array([ZCBF(x) for x in X_draw])
+            ax.scatter3D(rel_x_dist, rel_y_dist, hx, c=hx, cmap='Reds', alpha=0.1)
         plt.legend(['learned CBF', 'constructive CBF'], fontsize=1.2 * fs)
         ax.set_xticks([-1, 0, 1])
         ax.set_yticks([-1, 0, 1])
@@ -1046,8 +1069,9 @@ if __name__ == '__main__':
     ax.xaxis.set_tick_params(labelsize=fs)
     ax.yaxis.set_tick_params(labelsize=fs)
     ax.zaxis.set_tick_params(labelsize=fs)
-    # plt.axis('equal')
-    # plt.savefig('airplane_CBFs.pdf', dpi=300)
+    plt.axis('equal')
+    plt.savefig('airplane_CBFs.png', dpi=300)
+    plt.show(   )
 
     # Safe closed-loop control with the learned CBF
     if use_human_data:

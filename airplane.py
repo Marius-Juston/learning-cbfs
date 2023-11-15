@@ -1,22 +1,17 @@
-# from jax.experimental import optimizers
 import time
-from functools import partial
 
 import jax.numpy as jnp
 import matplotlib.pylab as plt
 import torch
 from casadi import *
-from jax import random, vmap, jit, grad, ops, lax, tree_util
-from jax.example_libraries import optimizers
-from jax.flatten_util import ravel_pytree
+from jax import random
 from skopt.sampler import Hammersly
 from torch import Tensor, autograd
-from torch.nn import Sequential, ReLU
 from torch.optim import Adam
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, ReduceLROnPlateau
 from torch.utils.tensorboard import SummaryWriter
 
-from lipchitz_network import OneLipschitzModule
+from lipchitz_network import SequentialLipschitz
 
 
 def ODE_RHS(x, u):
@@ -454,33 +449,39 @@ def plot_closed_loop_multiple(X_cl_plot):
     # plt.yticks(np.arange(-2.0, 2.0+0.1, 0.5))
     plt.xlim([-2.0, 2.0])
     plt.ylim([-2.0, 2.0])
-    plt.axis('equal')
+    # plt.axis('equal')
     plt.grid()
-    plt.savefig('airplane_traj.pdf', dpi=300)
-    plt.show()
+    plt.savefig('airplane_traj.png', dpi=300)
+    # plt.show()
 
 
 # A NN is represented as a list of [(W_1, b_1), ..., (W_n, b_n)]
 # where n is the number of layers
 def pytorch_h_model(inputs, params):
-    net = []
+    # net = []
+    #
+    # previous = None
+    #
+    # for W, b in params[:-1]:
+    #     if previous is None:
+    #         previous = W.shape[0]
+    #
+    #     next_output = W.shape[1]
+    #
+    #     net.append(OneLipschitzModule(previous, next_output))
+    #
+    #     net.append(ReLU())
+    #
+    #     previous = next_output
+    #
+    # net.append(OneLipschitzModule(previous, 1))
+    # return Sequential(*net)
 
-    previous = None
+    return SequentialLipschitz(input_size=params[0][0].shape[0], output_size=1, hidden_sizes=[32, 64, 32],
+                               scalable_lipschitz=True)
 
-    for W, b in params[:-1]:
-        if previous is None:
-            previous = W.shape[0]
-
-        next_output = W.shape[1]
-
-        net.append(OneLipschitzModule(previous, next_output))
-
-        net.append(ReLU())
-
-        previous = next_output
-
-    net.append(OneLipschitzModule(previous, 1))
-    return Sequential(*net)
+    # return Sequential(Linear(6, 32),
+    #                   ReLU(), Linear(32, 64), ReLU(), Linear(64, 32), ReLU(), Linear(32, 1))
 
 
 def pytorch_r_with_input(h_model, x, u):
@@ -506,31 +507,41 @@ def pytorch_r_with_input(h_model, x, u):
 
 def pytorch_loss(h_model, x_constraint, x_expert_unsafe, u_constraint, x_boundary, x_safe, x_unsafe,
                  safe_value, unsafe_value, lam_constraint, lam_boundary, lam_safe, lam_unsafe, lam_param,
-                 gamma):
+                 gamma, writer, epoch):
+    # loss_funct = lambda x: x
+    loss_funct = torch.relu
+
     if x_boundary is not None:
-        boundary_cost = torch.square(h_model(x_boundary)).mean()
+        boundary_cost = torch.square(h_model(x_boundary)).mean() * 0
     else:
         boundary_cost = 0.0
 
         # try to enforce h(x) >= safe_value on safe set
 
-    safe_cost = torch.relu(safe_value - h_model(x_safe)).mean() + torch.relu(safe_value / 10 - h_model(x_safe)).mean()
+    safe_cost = loss_funct(safe_value - h_model(x_safe)).mean() + loss_funct(
+        safe_value / 10 - h_model(x_constraint)).mean()
 
     # try to enforce h(x) <= -unsafe_value on unsafe set
     if x_unsafe is not None:
-        unsafe_cost = torch.relu(h_model(x_unsafe) + unsafe_value).mean() + torch.relu(
+        unsafe_cost = loss_funct(h_model(x_unsafe) + unsafe_value).mean() + loss_funct(
             h_model(x_expert_unsafe) + unsafe_value / 10).mean()
     else:
         unsafe_cost = 0.0
 
     # try to enforce the CBF inequality constraint
-    constraint_cost = torch.relu(-pytorch_r_with_input(h_model, x_constraint, u_constraint) + gamma).mean() + \
+    constraint_cost = loss_funct(-pytorch_r_with_input(h_model, x_constraint, u_constraint) + gamma).mean() + \
                       0.001 * torch.square(pytorch_r_with_input(h_model, x_constraint, u_constraint)).mean()
+    # constraint_cost *= 0
 
     # Seems to be a normalize cost for the weights, you can forgo this as the Lipschitz model helps
     # reduce the risk of overfitting
 
     # param_cost = torch.sum(torch.square(ravel_pytree(params)[0]))
+
+    writer.add_scalar("loss/constraint", constraint_cost, epoch)
+    writer.add_scalar("loss/boundary", boundary_cost, epoch)
+    writer.add_scalar("loss/safe", safe_cost, epoch)
+    writer.add_scalar("loss/unsafe", unsafe_cost, epoch)
 
     return (
             lam_constraint * constraint_cost + lam_boundary * boundary_cost + lam_safe * safe_cost
@@ -541,8 +552,9 @@ def pytorch_loss(h_model, x_constraint, x_expert_unsafe, u_constraint, x_boundar
 
 def pytorch_training(init_params, num_batches, x_constraint, x_expert_unsafe, u_constraint, u_expert_unsafe,
                      boundary_points,
-                     safe_points, unsafe_points, start_epoch, num_epochs,
-                     safe_value, unsafe_value, lam_constraint, lam_boundary, lam_safe, lam_unsafe, lam_param, gamma, use_save=True):
+                     safe_points, unsafe_points, safe_value, unsafe_value, lam_constraint, lam_boundary, lam_safe,
+                     lam_unsafe, lam_param, gamma,
+                     use_save=True):
     lam_constraint_batch = lam_constraint * num_batches
     lam_boundary_batch = lam_boundary * num_batches
     lam_safe_batch = lam_safe * num_batches
@@ -556,9 +568,8 @@ def pytorch_training(init_params, num_batches, x_constraint, x_expert_unsafe, u_
     net = net.to(device)
 
     if os.path.exists(MODEL_PATH_FILE):
-        net.load_state_dict(torch.load(MODEL_PATH_FILE))
-
         if use_save:
+            net.load_state_dict(torch.load(MODEL_PATH_FILE))
             return net
 
     # net = torch.compile(net, mode='max-autotune-no-cudagraphs')
@@ -579,37 +590,66 @@ def pytorch_training(init_params, num_batches, x_constraint, x_expert_unsafe, u_
     else:
         unsafe_points = torch.tensor(np.array(unsafe_points), requires_grad=True)
 
-    optimizer = Adam(net.parameters(), lr=1e-3, amsgrad=True)
+    optimizer = Adam(net.parameters(), lr=1e-3)
 
     summary_writer = SummaryWriter()
 
     summary_writer.add_graph(net, x_constraint)
 
     scheduler = CosineAnnealingWarmRestarts(optimizer, 500)
+    scheduler2 = ReduceLROnPlateau(optimizer, patience=500)
+
+    logging_interval = 100
 
     for i in range(10000):
         optimizer.zero_grad()
 
-        loss = pytorch_loss(net, x_constraint, x_expert_unsafe, u_constraint, boundary_points,
-                            safe_points, unsafe_points, safe_value, unsafe_value, lam_constraint, lam_boundary,
-                            lam_safe,
-                            lam_unsafe, lam_param, gamma)
+        loss_h = pytorch_loss(net, x_constraint, x_expert_unsafe, u_constraint, boundary_points,
+                              safe_points, unsafe_points, safe_value, unsafe_value, 1, 1,
+                              1,
+                              1, 1, gamma, summary_writer, i)
+        # loss_lipschitz = net.get_lipschitz()
+        if callable(getattr(net, "get_lipschitz", None)):
+            loss_lipschitz = net.get_lipschitz()
+        else:
+            loss_lipschitz = 0.0
 
-        loss.backward()
+        total_loss = loss_h + loss_lipschitz * 0.1
+
+        total_loss.backward()
         optimizer.step()
 
         scheduler.step()
+        scheduler2.step(total_loss)
 
-        summary_writer.add_scalar('loss', loss, i)
+        summary_writer.add_scalar('loss/total', total_loss, i)
+        summary_writer.add_scalar('loss/h_function', loss_h, i)
+        summary_writer.add_scalar('loss/lipschitz', loss_lipschitz, i)
         summary_writer.add_scalar('lr', scheduler.get_last_lr()[0], i)
 
+        if i % logging_interval == 0:
+            for name, param in net.named_parameters():
+                if len(param.shape) == 1 and param.shape[0] == 1:
+                    summary_writer.add_scalar(name, param, i)
+                else:
+                    summary_writer.add_histogram(name, param, i)
+
         print(
-            "epoch", (i + 1) * block_size, "| loss",
-            loss.item(), "| elapsed",
-                     time.time() - start_time, "seconds"
+            "epoch", (i + 1), "| loss",
+            total_loss.item(), "| loss_h",
+            loss_h.item(), "| loss_l",
+            loss_lipschitz.item() if loss_lipschitz != 0.0 else 0.0, "| elapsed",
+            time.time() - start_time, "seconds"
         )
 
+    with torch.no_grad():
+        x = torch.vstack([x_constraint, x_expert_unsafe, unsafe_points])
+
+        summary_writer.add_embedding(x, metadata=net(x))
+
+    print("Saving Network")
     torch.save(net.state_dict(), "1nn.pth")
+    print("Finished Saving Network")
 
     return net
 
@@ -627,8 +667,12 @@ if __name__ == '__main__':
     use_human_data = False
     sf = 1.
 
-    if not (os.path.exists("airplane_example/datasets/CBF-MPC/X_train.npy") and os.path.exists(
-            "airplane_example/datasets/CBF-MPC/U_train.npy")):
+    regenerate_data = False
+
+    save_directory = 'airplane_example/datasets/CBF-MPC'
+
+    if not (os.path.exists(f"{save_directory}/X_train.npy") and os.path.exists(
+            f"{save_directory}/U_train.npy")) or regenerate_data:
         # Option 2: Generate expert demonstrations using CBF-MPC
         # First generate a set of initial and the corresponding goal states
         X_start_t, X_goal_t = generate_init_condition(R=0.35, num_points=100)
@@ -657,13 +701,13 @@ if __name__ == '__main__':
             X_train = np.vstack((X_train, X_train_raw[i,]))
             U_train = np.vstack((U_train, U_train_raw[i,]))
         h_train = np.array([ZCBF(x) for x in X_train])
-        np.save('X_train.npy', X_train)
-        np.save('U_train.npy', U_train)
-        np.save('h_train.npy', h_train)
+        np.save(f'{save_directory}/X_train.npy', X_train)
+        np.save(f'{save_directory}/U_train.npy', U_train)
+        np.save(f'{save_directory}/h_train.npy', h_train)
     else:
-        X_train = np.load("airplane_example/datasets/CBF-MPC/X_train.npy")
-        U_train = np.load('airplane_example/datasets/CBF-MPC/U_train.npy')
-        # h_train = np.load('airplane_example/datasets/CBF-MPC/h_train.npy')
+        X_train = np.load(f"{save_directory}/X_train.npy")
+        U_train = np.load(f'{save_directory}/U_train.npy')
+        # h_train = np.load(f'{save_directory}/h_train.npy')
 
     # Define the model for the CBF candidate. We use a fully connected two layer NN.
     n_inputs = 6  # state dimension
@@ -674,6 +718,12 @@ if __name__ == '__main__':
     rng = PRNG(5433)
     init_params = [[
         random.normal(rng.next(), shape=(n_inputs, n_hidden)),
+        random.normal(rng.next(), shape=(n_hidden,))
+    ], [
+        random.normal(rng.next(), shape=(n_hidden, n_hidden * 2)),
+        random.normal(rng.next(), shape=(n_hidden * 2,))
+    ], [
+        random.normal(rng.next(), shape=(n_hidden * 2, n_hidden)),
         random.normal(rng.next(), shape=(n_hidden,))
     ],
         [
@@ -770,7 +820,7 @@ if __name__ == '__main__':
 
         bounds = [(-2.5, 2.5), (-2.5, 2.5), (0., np.pi), (-2.5, 2.5), (-2.5, 2.5), (0, np.pi)]
 
-        safe_points = np.array(safe_points_ham.generate(bounds, n_safe_samples, random_state=random_seed))
+        safe_points = np.array(safe_points_ham.generate(bounds, n_safe_samples // 2, random_state=random_seed))
 
         safe_points, _ = get_ring_data(
             safe_points, None, 1.5, 2.5, 0
@@ -793,7 +843,7 @@ if __name__ == '__main__':
 
         bounds = [(-Ds, Ds), (-Ds, Ds), (0., np.pi), (-Ds, Ds), (-Ds, Ds), (0, np.pi)]
 
-        unsafe_points_s_far = np.array(safe_points_ham.generate(bounds, n_unsafe_samples, random_state=random_seed))
+        unsafe_points_s_far = np.array(safe_points_ham.generate(bounds, 20000, random_state=random_seed))
 
         unsafe_points_s_far, _ = get_ring_data(unsafe_points_s_far, None, 0, 0.4, verbose=0)
         unsafe_points_s_far = unsafe_points_s_far[0:n_unsafe_samples // n_angle_grid, :]
@@ -861,17 +911,19 @@ if __name__ == '__main__':
     unsafe_value = 0.5
     lam_constraint = 15.0
     lam_boundary = 1.0
+    # lam_safe = 15.0
     lam_safe = 2.0
+    # lam_unsafe = 15.0
     lam_unsafe = 2.0
     lam_param = 0.1
     gamma = 0.05
 
-    h_model = pytorch_training(init_params, num_batches, x_constraint, x_expert_unsafe, u_constraint, u_expert_unsafe, None,
-                     x_safe, x_unsafe, i * block_size, block_size,
-                     safe_value, unsafe_value, lam_constraint, lam_boundary, lam_safe, lam_unsafe, lam_param,
-                     gamma, use_save=True)
+    h_model = pytorch_training(init_params, num_batches, x_constraint, x_expert_unsafe, u_constraint, u_expert_unsafe,
+                               None,
+                               x_safe, x_unsafe, safe_value, unsafe_value, lam_constraint, lam_boundary, lam_safe,
+                               lam_unsafe, lam_param,
+                               gamma, use_save=False)
     h_model = h_model.eval()
-
 
     # Evaluate and plot the CBF at the training points
     X_draw = X_train[:, :]
@@ -915,7 +967,7 @@ if __name__ == '__main__':
     ax.zaxis.set_tick_params(labelsize=fs)
     plt.axis('equal')
     plt.savefig('airplane_CBFs.png', dpi=300)
-    plt.show(   )
+    plt.show()
 
     # Safe closed-loop control with the learned CBF
     if use_human_data:
@@ -930,7 +982,8 @@ if __name__ == '__main__':
         X_start, X_goal = generate_init_condition(R=1.0, num_points=24)
     X_cl_LCBF = []  # store the closed-loop trajectories
     min_sep_set = []  # store the minimum separation between the two airplanes
-    idx_set = [17, 6, 21, 2, 4, 19, 0]  # the initial heading indices we used in our paper
+    idx_set = [0, 17, 6, 21, 2, 4, 19]  # the initial heading indices we used in our paper
+    # idx_set = [ 0]  # the initial heading indices we used in our paper
     for idx in idx_set:
         x_init = list(X_start[idx, :])
         x_goal = list(X_goal[idx, :])

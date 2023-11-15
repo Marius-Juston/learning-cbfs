@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from torch.nn import Parameter, Sequential, ReLU
-from torch.optim import SGD
+from torch.optim import Adam
 
 
 class OneLipschitzModule(nn.Linear):
@@ -38,7 +38,7 @@ if __name__ == '__main__':
     net = Sequential(module1, ReLU(), module2, ReLU(), module3)
 
     criterion = nn.MSELoss()
-    optimizer = SGD(net.parameters(), lr=0.01, momentum=0.9)
+    optimizer = Adam(net.parameters(), lr=0.01)
 
     for epoch in range(1000):  # loop over the dataset multiple times
 
@@ -61,8 +61,14 @@ if __name__ == '__main__':
 
         plt.scatter(X, Y, c='r')
 
-        X = torch.arange(-10, 10, 0.1).view(-1, 1)
+        dt = 0.01
+        X = torch.arange(-10, 10, dt).view(-1, 1)
         y_pred = net(X)
+
+        y_pred = torch.clamp_min(y_pred, 0)
+
+        L = torch.max(torch.abs((X[1:] - X[:-1]) / dt))
+        print(L)
 
         plt.plot(X, y_pred, c='b')
 

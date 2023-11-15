@@ -872,6 +872,12 @@ if __name__ == '__main__':
             random.uniform(rng.next(), shape=(n_safe_samples // 2,), minval=-2.5, maxval=2.5),
             random.uniform(rng.next(), shape=(n_safe_samples // 2,), minval=0.0, maxval=3.1415)
         )).T
+        safe_points_ham = Hammersly()
+
+        bounds = [(-2.5, 2.5), (-2.5, 2.5), (0., np.pi), (-2.5, 2.5), (-2.5, 2.5), (0, np.pi)]
+
+        safe_points = np.array(safe_points_ham.generate(bounds, n_safe_samples))
+
         safe_points, _ = get_ring_data(
             safe_points, None, 1.5, 2.5, 0
         )  # also add all x_constraint to safe samples
@@ -890,6 +896,11 @@ if __name__ == '__main__':
                            maxval=Ds), random.uniform(rng.next(), shape=(20000,), minval=-Ds, maxval=Ds),
             random.uniform(rng.next(), shape=(20000,), minval=0.0, maxval=np.pi)
         )).T
+
+        bounds = [(-Ds, Ds), (-Ds, Ds), (0., np.pi), (-Ds, Ds), (-Ds, Ds), (0, np.pi)]
+
+        unsafe_points_s_far = np.array(safe_points_ham.generate(bounds, n_unsafe_samples))
+
         unsafe_points_s_far, _ = get_ring_data(unsafe_points_s_far, None, 0, 0.4, verbose=0)
         unsafe_points_s_far = unsafe_points_s_far[0:n_unsafe_samples // n_angle_grid, :]
         unsafe_points_s = unsafe_points_s_far

@@ -1,4 +1,4 @@
-from typing import Iterable
+from typing import Sequence
 
 import matplotlib.pyplot as plt
 import torch
@@ -10,14 +10,13 @@ from torch.optim import Adam
 
 
 class SequentialLipschitz(nn.Module):
-    def __init__(self, input_size: int, output_size: int = 1, hidden_sizes: Iterable[int] = None,
+    def __init__(self, input_size: int, output_size: int = 1, hidden_sizes: Sequence[int] = None,
                  activation: torch.nn.Module = ReLU, scalable_lipschitz=False, device=None, dtype=None):
         super().__init__()
         self.output_size = output_size
         self.activation = activation
         self.hidden_layers = hidden_sizes
         self.input_size = input_size
-
         net = []
 
         self.scaling_params = []
@@ -27,7 +26,7 @@ class SequentialLipschitz(nn.Module):
             if scalable_lipschitz:
                 name = f"lipschitz_scale_{i}"
 
-                scaling = Parameter(torch.ones(1))
+                scaling = Parameter(torch.ones(1, device=device, dtype=dtype))
 
                 self.scaling_params.append(scaling)
 
@@ -41,9 +40,9 @@ class SequentialLipschitz(nn.Module):
             input_size = hidden
 
         if scalable_lipschitz:
-            name = f"lipschitz_scale_output"
+            name = f"lipschitz_scale_{len(hidden_sizes)}"
 
-            scaling = Parameter(torch.ones(1))
+            scaling = Parameter(torch.ones(1, device=device, dtype=dtype))
             self.scaling_params.append(scaling)
 
             self.register_parameter(name, scaling)
@@ -121,6 +120,7 @@ if __name__ == '__main__':
             print(f'[{epoch + 1}, {epoch + 1:5d}] loss: {loss.item():.3f}')
 
     print('Finished Training')
+    print(net.scaling_params)
 
     with torch.no_grad():
 

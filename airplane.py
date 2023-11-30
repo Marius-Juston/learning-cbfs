@@ -7,6 +7,7 @@ from casadi import *
 from jax import random
 from skopt.sampler import Hammersly
 from torch import Tensor, autograd
+from torch.nn import Sequential, Linear, ReLU
 from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, ReduceLROnPlateau
 from torch.utils.tensorboard import SummaryWriter
@@ -458,30 +459,12 @@ def plot_closed_loop_multiple(X_cl_plot):
 # A NN is represented as a list of [(W_1, b_1), ..., (W_n, b_n)]
 # where n is the number of layers
 def pytorch_h_model(inputs, params):
-    # net = []
-    #
-    # previous = None
-    #
-    # for W, b in params[:-1]:
-    #     if previous is None:
-    #         previous = W.shape[0]
-    #
-    #     next_output = W.shape[1]
-    #
-    #     net.append(OneLipschitzModule(previous, next_output))
-    #
-    #     net.append(ReLU())
-    #
-    #     previous = next_output
-    #
-    # net.append(OneLipschitzModule(previous, 1))
-    # return Sequential(*net)
+    # The L Lipchtiz implementation
+    # return SequentialLipschitz(input_size=params[0][0].shape[0], output_size=1, hidden_sizes=[32, 64, 32],
+    #                            scalable_lipschitz=True)
 
-    return SequentialLipschitz(input_size=params[0][0].shape[0], output_size=1, hidden_sizes=[32, 64, 32],
-                               scalable_lipschitz=True)
-
-    # return Sequential(Linear(6, 32),
-    #                   ReLU(), Linear(32, 64), ReLU(), Linear(64, 32), ReLU(), Linear(32, 1))
+    return Sequential(Linear(6, 32),
+                      ReLU(), Linear(32, 64), ReLU(), Linear(64, 32), ReLU(), Linear(32, 1))
 
 
 def pytorch_r_with_input(h_model, x, u):
@@ -506,13 +489,13 @@ def pytorch_r_with_input(h_model, x, u):
 
 
 def pytorch_loss(h_model, x_constraint, x_expert_unsafe, u_constraint, x_boundary, x_safe, x_unsafe,
-                 safe_value, unsafe_value, lam_constraint, lam_boundary, lam_safe, lam_unsafe, lam_param,
-                 gamma, writer, epoch):
+                 safe_value, unsafe_value, lam_constraint, lam_boundary, lam_safe, lam_unsafe, gamma, writer, epoch):
     # loss_funct = lambda x: x
     loss_funct = torch.relu
+    # loss_funct = torch.nn.ELU()
 
     if x_boundary is not None:
-        boundary_cost = torch.square(h_model(x_boundary)).mean() * 0
+        boundary_cost = torch.square(h_model(x_boundary)).mean()
     else:
         boundary_cost = 0.0
 
@@ -601,20 +584,20 @@ def pytorch_training(init_params, num_batches, x_constraint, x_expert_unsafe, u_
 
     logging_interval = 100
 
-    for i in range(10000):
+    for i in range(int(1e5)):
         optimizer.zero_grad()
 
         loss_h = pytorch_loss(net, x_constraint, x_expert_unsafe, u_constraint, boundary_points,
-                              safe_points, unsafe_points, safe_value, unsafe_value, 1, 1,
-                              1,
-                              1, 1, gamma, summary_writer, i)
+                              safe_points, unsafe_points, safe_value, unsafe_value, lam_constraint , lam_boundary ,
+                              lam_safe,
+                              lam_unsafe, gamma, summary_writer, i)
         # loss_lipschitz = net.get_lipschitz()
         if callable(getattr(net, "get_lipschitz", None)):
-            loss_lipschitz = net.get_lipschitz()
+            loss_lipschitz = net.get_lipschitz()**2
         else:
             loss_lipschitz = 0.0
 
-        total_loss = loss_h + loss_lipschitz * 0.1
+        total_loss = loss_h + loss_lipschitz / 16 * 0.5
 
         total_loss.backward()
         optimizer.step()
@@ -829,7 +812,7 @@ if __name__ == '__main__':
 
         # Unsafe samples (inside the N ring)
         n_angle_grid = 10
-        n_unsafe_samples = 500
+        n_unsafe_samples = 5000
         angle_grid_a = list(np.linspace(0, -2 * pi, n_angle_grid).T)
         angle_grid_b = list(np.linspace(pi, -pi, n_angle_grid).T)
         unsafe_points_s_far = np.vstack((
@@ -898,7 +881,7 @@ if __name__ == '__main__':
     # plt.legend(['expert trajectories','safe samples','unsafe samples'], fontsize = fs)
     plt.grid()
     plt.savefig('airplane_data.png', dpi=300)
-    # plt.show()
+    plt.show()
 
     rng = PRNG(5433)
     start_time = time.time()
@@ -982,8 +965,8 @@ if __name__ == '__main__':
         X_start, X_goal = generate_init_condition(R=1.0, num_points=24)
     X_cl_LCBF = []  # store the closed-loop trajectories
     min_sep_set = []  # store the minimum separation between the two airplanes
-    idx_set = [0, 17, 6, 21, 2, 4, 19]  # the initial heading indices we used in our paper
-    # idx_set = [ 0]  # the initial heading indices we used in our paper
+    # idx_set = [0, 17, 6, 21, 2, 4, 19]  # the initial heading indices we used in our paper
+    idx_set = [ 0]  # the initial heading indices we used in our paper
     for idx in idx_set:
         x_init = list(X_start[idx, :])
         x_goal = list(X_goal[idx, :])
